@@ -12,10 +12,11 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
-use crate::cwd_updater::{CwdUpdater, pty_parent_fd};
 use crate::debug::{MarkerDebugHighlighter, RESET};
+use crate::foreground::{Foreground, ForegroundUpdater, pty_parent_fd};
 use crate::pty_proxy::RuntimeOptions;
 use crate::screen::{self, Msg, SocketServer};
+use crate::title::TerminalTitle;
 
 /// The current version of the pty-proxy protocol.
 ///
@@ -200,8 +201,11 @@ async fn run(options: RuntimeOptions) -> Result<i32, Error> {
     let child_pid =
         child.process_id().and_then(|pid| rustix::process::Pid::from_raw(pid.cast_signed()));
     // Update this process's CWD to match the child's CWD. This is necessary to enable programs like
-    // tmux to track the child's CWD.
-    let cwd_updater = CwdUpdater::new(pair.master.as_ref(), child_pid);
+    // tmux to track the child's CWD. Terminals that name the program running in them would
+    // otherwise name the proxy, so the updater also names the child's foreground for the title.
+    let (leaders_tx, mut leaders) = mpsc::channel(1);
+    let foreground_updater = ForegroundUpdater::new(pair.master.as_ref(), child_pid, leaders_tx);
+    let mut title = TerminalTitle::new(Foreground::new(pair.master.as_ref(), child_pid));
     let mut sigchld = signal(SignalKind::child())?;
     spawn_resize_handler(pair.master, msg_tx.clone())?;
     terminal::enable_raw_mode()?;
@@ -212,26 +216,37 @@ async fn run(options: RuntimeOptions) -> Result<i32, Error> {
         let mut buf = [0u8; 8192];
 
         loop {
-            match pty_reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let raw_data = &buf[..n];
-                    let highlighted;
-                    let data: &[u8] = if let Some(highlighter) = &mut highlighter {
-                        highlighted = highlighter.render(raw_data);
-                        &highlighted
-                    } else {
-                        raw_data
-                    };
+            tokio::select! {
+                read = pty_reader.read(&mut buf) => match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let raw_data = &buf[..n];
+                        let highlighted;
+                        let data: &[u8] = if let Some(highlighter) = &mut highlighter {
+                            highlighted = highlighter.render(raw_data);
+                            &highlighted
+                        } else {
+                            raw_data
+                        };
 
-                    if stdout.write_all(data).await.is_err() {
+                        title.track(data);
+                        if stdout.write_all(data).await.is_err() {
+                            break;
+                        }
+
+                        // Only after the terminal has the chunk: handing it to the parser wakes the
+                        // parser's thread, a syscall that would otherwise delay every echoed
+                        // keystroke.
+                        let _ = msg_tx.send(Msg::Data(raw_data.to_vec())).await;
+                        foreground_updater.update();
+                    }
+                },
+                Some(leader) = leaders.recv() => {
+                    if let Some(sequence) = title.retitle(leader)
+                        && stdout.write_all(&sequence).await.is_err()
+                    {
                         break;
                     }
-
-                    // Only after the terminal has the chunk: handing it to the parser wakes the
-                    // parser's thread, a syscall that would otherwise delay every echoed keystroke.
-                    let _ = msg_tx.send(Msg::Data(raw_data.to_vec())).await;
-                    cwd_updater.update();
                 }
             }
         }

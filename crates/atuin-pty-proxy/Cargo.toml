@@ -34,6 +34,12 @@ proptest = { workspace = true }
 regex = { workspace = true }
 rstest = { workspace = true }
 tempfile = { workspace = true }
+# The parser atuin-vt100 is built on, as the reference the escape tracker is checked against.
+vte = { workspace = true }
+
+[[bench]]
+name = "escape_tracker"
+harness = false
 
 [[bench]]
 name = "markers"
