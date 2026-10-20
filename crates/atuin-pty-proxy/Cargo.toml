@@ -38,10 +38,6 @@ tempfile = { workspace = true }
 vte = { workspace = true }
 
 [[bench]]
-name = "escape_tracker"
-harness = false
-
-[[bench]]
 name = "markers"
 harness = false
 
