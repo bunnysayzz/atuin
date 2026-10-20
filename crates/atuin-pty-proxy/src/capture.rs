@@ -5,7 +5,7 @@ use atuin_client::history::HistoryId;
 use atuin_common::string::TrimExt as _;
 use atuin_common::string::bounded_buffer::{self, BoundedBuffer, BufferContents};
 
-use crate::markers::{self, Event, EventChunk, EventChunks};
+use crate::parser::{self, Event, EventChunk, EventChunks};
 
 /// Clears the screen while maintaining cursor position.
 ///
@@ -204,6 +204,7 @@ impl TrackerCore {
         match chunk.event {
             Event::OutputStart(history_id) => self.start_capture(history_id),
             Event::OutputEnd(history_id) => self.end_capture(history_id, chunk.osc_len),
+            Event::Title => {}
         }
     }
 
@@ -227,7 +228,7 @@ impl TrackerCore {
 }
 
 pub struct CommandCaptureTracker {
-    marker_parser: markers::Parser,
+    marker_parser: parser::Parser,
     core: TrackerCore,
 }
 
@@ -238,7 +239,7 @@ impl CommandCaptureTracker {
             max_output_bytes,
         } = config;
         Self {
-            marker_parser: markers::Parser::new(),
+            marker_parser: parser::Parser::new(),
             core: TrackerCore {
                 emulator: vt100::Parser::new_with_callbacks(
                     rows,

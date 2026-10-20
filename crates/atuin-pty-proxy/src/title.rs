@@ -24,8 +24,8 @@ use std::ffi::OsStr;
 use atuin_common::os::unix::process;
 use rustix::process::Pid;
 
-use crate::escape_tracker::EscapeTracker;
 use crate::foreground::Foreground;
+use crate::parser::{Event, Parser};
 
 /// The leader of the process group in the foreground, as a look at the foreground found it.
 pub struct Leader {
@@ -88,8 +88,8 @@ impl Owner {
 /// What the proxy knows of the terminal's title, from following everything written to it.
 pub struct TerminalTitle {
     foreground: Foreground,
-    /// The escape sequences in everything written to the terminal so far.
-    escapes: EscapeTracker,
+    /// Follows everything written to the terminal so far.
+    output: Parser,
     owner: Owner,
     /// The title the proxy set, while the terminal still shows it.
     shown: Option<String>,
@@ -99,7 +99,7 @@ impl TerminalTitle {
     pub fn new(foreground: Foreground) -> Self {
         Self {
             foreground,
-            escapes: EscapeTracker::default(),
+            output: Parser::new(),
             owner: Owner::Proxy,
             shown: None,
         }
@@ -107,7 +107,7 @@ impl TerminalTitle {
 
     /// Follow the child's `data` on its way to the terminal.
     pub fn track(&mut self, data: &[u8]) {
-        if self.escapes.push(data) {
+        if self.output.push(data).any(|chunk| chunk.event == Event::Title) {
             // The program that set the title has most likely not left the foreground yet.
             self.owner = Owner::of_title_set_with(self.foreground.group(), self.foreground.child());
             self.shown = None;
@@ -121,7 +121,7 @@ impl TerminalTitle {
     pub fn retitle(&mut self, leader: Leader) -> Option<Vec<u8>> {
         // A program may have taken the foreground, and set a title that must stand, since the look
         // that found `leader`. The next look names it.
-        if self.foreground.group() != Some(leader.group) || !self.escapes.at_ground() {
+        if self.foreground.group() != Some(leader.group) || !self.output.at_ground() {
             return None;
         }
         self.owner = self.owner.with_foreground(leader.group);

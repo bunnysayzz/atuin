@@ -3,11 +3,9 @@ mod capture;
 #[cfg(unix)]
 mod debug;
 #[cfg(unix)]
-mod escape_tracker;
-#[cfg(unix)]
 mod foreground;
 #[cfg(unix)]
-mod markers;
+mod parser;
 #[cfg(unix)]
 mod pty_proxy;
 #[cfg(unix)]
