@@ -13,7 +13,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 use crate::debug::RESET;
-use crate::foreground::{Foreground, ForegroundUpdater, pty_parent_fd};
+use crate::foreground::{ForegroundUpdater, pty_parent_fd};
 use crate::parser::Parser;
 use crate::pty_proxy::RuntimeOptions;
 use crate::screen::{self, Msg, SocketServer};
@@ -206,7 +206,7 @@ async fn run(options: RuntimeOptions) -> Result<i32, Error> {
     // otherwise name the proxy, so the updater also names the child's foreground for the title.
     let (leaders_tx, mut leaders) = mpsc::channel(1);
     let foreground_updater = ForegroundUpdater::new(pair.master.as_ref(), child_pid, leaders_tx);
-    let mut title = TerminalTitle::new(Foreground::new(pair.master.as_ref(), child_pid));
+    let mut title = TerminalTitle::new();
     let mut sigchld = signal(SignalKind::child())?;
     spawn_resize_handler(pair.master, msg_tx.clone())?;
     terminal::enable_raw_mode()?;

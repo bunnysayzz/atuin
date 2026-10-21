@@ -26,8 +26,6 @@ portable-pty = { workspace = true }
 rustix = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-# `simd` searches text with memchr.
-winnow = { workspace = true, features = ["simd"] }
 
 [dev-dependencies]
 divan = { workspace = true }

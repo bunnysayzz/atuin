@@ -4,7 +4,7 @@ fn main() {
 
 // Compile the parser straight into the bench binary rather than exposing it through the library's
 // public API just to measure it. The module only needs std and crates the bench can already see
-// (memchr, winnow, atuin-client), and `harness = false` means it builds without `cfg(test)`, so its test
+// (memchr, atuin-client), and `harness = false` means it builds without `cfg(test)`, so its test
 // submodule is dropped. It lives at the crate root (not inside `mod unix`) so `#[path]` resolves
 // against `benches/`, a directory that actually exists.
 #[cfg(unix)]

@@ -11,21 +11,13 @@ use atuin_common::os::unix::process;
 use portable_pty::MasterPty;
 use rustix::process::Pid;
 use tokio::sync::mpsc;
-use tokio::time::Instant;
 
 use crate::title::Leader;
 
-/// The minimum amount of time between successive CWD updates.
+/// The minimum amount of time between successive CWD and title updates.
 ///
-/// Updating the CWD requires a syscall, so this is used to reduce the performance impact.
+/// Each update takes a few syscalls, so this is used to reduce the performance impact.
 const MIN_UPDATE_DELAY: Duration = Duration::from_millis(100);
-
-/// The minimum amount of time between successive looks at the name of the program in the
-/// foreground.
-///
-/// tmux waits as long before it renames a window, which keeps looking cheap while output streams
-/// and keeps most commands too short to matter out of the title.
-const MIN_TITLE_UPDATE_DELAY: Duration = Duration::from_millis(500);
 
 /// The maximum amount of time between successive CWD and title updates.
 ///
@@ -90,10 +82,6 @@ impl Foreground {
     pub fn group(&self) -> Option<Pid> {
         self.parent.as_ref().and_then(|parent| tcgetpgrp(parent.as_fd()))
     }
-
-    pub const fn child(&self) -> Option<Pid> {
-        self.child
-    }
 }
 
 /// Moves this process into the PTY proxy child's CWD.
@@ -145,7 +133,6 @@ impl ForegroundUpdater {
                 foreground,
                 cwd: None,
             };
-            let mut next_title_update = Instant::now();
 
             let timeout_after_min_delay = MAX_UPDATE_DELAY - MIN_UPDATE_DELAY;
             let mut timeout = MAX_UPDATE_DELAY;
@@ -156,22 +143,18 @@ impl ForegroundUpdater {
                 }
 
                 loop {
-                    let update_title = Instant::now() >= next_title_update;
                     // Off the runtime thread: a hung NFS or FUSE mount must stall only this task,
                     // never the forwarding of keystrokes and output. The title is looked up in the
                     // same call, so the blocking pool needs only the one thread.
                     let following = tokio::task::spawn_blocking(move || {
                         follower.follow();
-                        let leader = update_title.then(|| Leader::of(&follower.foreground));
-                        (follower, leader.flatten())
+                        let leader = Leader::of(&follower.foreground);
+                        (follower, leader)
                     });
                     let Ok((followed, leader)) = following.await else {
                         return;
                     };
                     follower = followed;
-                    if update_title {
-                        next_title_update = Instant::now() + MIN_TITLE_UPDATE_DELAY;
-                    }
                     if let Some(leader) = leader
                         && leaders.send(leader).await.is_err()
                     {
@@ -180,12 +163,7 @@ impl ForegroundUpdater {
 
                     tokio::time::sleep(MIN_UPDATE_DELAY).await;
                     if rx.try_recv().is_err() {
-                        timeout = if update_title {
-                            timeout_after_min_delay
-                        } else {
-                            // This update came too soon for the title, which is updated once due.
-                            next_title_update.saturating_duration_since(Instant::now())
-                        };
+                        timeout = timeout_after_min_delay;
                         break;
                     }
                 }
@@ -196,7 +174,7 @@ impl ForegroundUpdater {
     }
 
     /// Tell the updater to update this process's CWD to match that of the PTY proxy child, and the
-    /// title if one is due.
+    /// title.
     pub fn update(&self) {
         // A full channel isn't an error; it means the updater has already been signaled to run.
         let _ = self.tx.try_send(());

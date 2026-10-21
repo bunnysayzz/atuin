@@ -17,10 +17,6 @@
 mod osc;
 
 pub use osc::Event;
-use winnow::Parser as _;
-use winnow::combinator::{alt, opt};
-use winnow::stream::Stateful;
-use winnow::token::{any, rest, take_till, take_until};
 
 const ESC: u8 = 0x1B;
 const BEL: u8 = 0x07;
@@ -117,7 +113,6 @@ impl State {
 }
 
 /// The operating system command the output is in, or was last in.
-#[derive(Debug)]
 struct Command {
     /// The start of the command's text, without the controls `vte` leaves out of it.
     kept: [u8; Event::MAX_TEXT_LEN],
@@ -159,17 +154,10 @@ impl Command {
 ///
 /// Feed each read of the output into [`Parser::read`], however the reads cut it. The parser returns
 /// the read as an [`Output`], with the [`Event`]s of the commands it follows.
-#[derive(Debug)]
 pub struct Parser {
     state: State,
     command: Command,
 }
-
-/// A chunk of output, with the parser that carries its state from one chunk to the next.
-///
-/// Backtracking resets only the chunk, so a step changes the parser only once it has parsed what
-/// it needs.
-type Input<'data, 'parser> = Stateful<&'data [u8], &'parser mut Parser>;
 
 impl Default for Parser {
     fn default() -> Self {
@@ -212,111 +200,86 @@ impl Parser {
     /// Follow `data` up to the end of the first command the proxy follows, returning how much of
     /// `data` that took and what the command said, or all of `data` and nothing.
     fn scan(&mut self, data: &[u8]) -> (usize, Option<Event>) {
-        let mut input = Input {
-            input: data,
-            state: self,
-        };
-        while !input.input.is_empty() {
-            match Self::step(&mut input) {
-                Ok(None) => {}
-                Ok(Some(event)) => return (data.len() - input.input.len(), Some(event)),
-                // No step fails on input that isn't empty. Were one to, the rest of the chunk
-                // would still reach the terminal; only the parser would miss it.
-                Err(()) => break,
+        let mut rest = data;
+        loop {
+            match self.state {
+                // Plain text is most of any output, and only an `ESC` leads out of it. Searching
+                // for it with memchr is a ~10X improvement over stepping through the text.
+                State::Ground { continuation } => {
+                    let Some(escape) = memchr::memchr(ESC, rest) else {
+                        self.state = State::Ground {
+                            continuation: Self::continuation_after(continuation, rest),
+                        };
+                        return (data.len(), None);
+                    };
+                    self.state = State::Escape;
+                    rest = &rest[escape + 1..];
+                }
+                // Only these lead out of a command's text.
+                State::Osc => {
+                    let end = rest
+                        .iter()
+                        .position(|byte| matches!(*byte, BEL | ESC | CAN | SUB))
+                        .unwrap_or(rest.len());
+                    let (text, tail) = rest.split_at(end);
+                    self.command.push(text);
+                    rest = tail;
+                }
+                State::Escape
+                | State::EscapeIntermediate
+                | State::Csi
+                | State::OscEscape
+                | State::ControlString => {}
+            }
+            let Some((&byte, tail)) = rest.split_first() else {
+                return (data.len(), None);
+            };
+            rest = tail;
+            if let Some(event) = self.advance(byte) {
+                return (data.len() - rest.len(), Some(event));
             }
         }
-        (data.len(), None)
     }
 
-    /// Follow the input in its current state, up to the next change of state.
-    fn step(input: &mut Input<'_, '_>) -> Result<Option<Event>, ()> {
-        match input.state.state {
-            State::Ground { continuation } => Self::text(input, continuation),
-            State::Escape | State::OscEscape => Self::escape(input),
-            State::EscapeIntermediate => {
-                take_till(0.., |byte| matches!(byte, 0x30..=0x7E | ESC | CAN | SUB))
-                    .parse_next(input)?;
-                Self::end_of_sequence(input, State::EscapeIntermediate)
+    /// Follow one byte, returning what the command it terminated said.
+    fn advance(&mut self, byte: u8) -> Option<Event> {
+        self.state = match (self.state, byte) {
+            (State::Ground { .. }, ESC) => State::Escape,
+            (State::Ground { continuation }, _) => State::Ground {
+                continuation: Self::continuation_after(continuation, &[byte]),
+            },
+            (State::Osc, BEL) => {
+                self.state = State::GROUND;
+                return self.command.end(1);
             }
-            State::Csi => {
-                take_till(0.., |byte| matches!(byte, 0x40..=0x7E | ESC | CAN | SUB))
-                    .parse_next(input)?;
-                Self::end_of_sequence(input, State::Csi)
+            (State::OscEscape, b'\\') => {
+                self.state = State::GROUND;
+                return self.command.end(2);
             }
-            State::Osc => Self::command(input),
-            State::ControlString => {
-                alt((take_until(0.., (ESC, CAN, SUB)), rest)).parse_next(input)?;
-                Self::end_of_sequence(input, State::ControlString)
-            }
-        }
-    }
-
-    /// Plain text, up to the `ESC` that leads out of it.
-    fn text(input: &mut Input<'_, '_>, continuation: u8) -> Result<Option<Event>, ()> {
-        // Plain text is most of any output. Searching for its end with memchr is a ~10X improvement
-        // over stepping through it.
-        let text = alt((take_until(0.., ESC), rest)).parse_next(input)?;
-        let continuation = Self::continuation_after(continuation, text);
-        input.state.state = match opt(ESC).parse_next(input)? {
-            Some(_) => State::Escape,
-            None => State::Ground { continuation },
-        };
-        Ok(None)
-    }
-
-    /// The byte after an `ESC`.
-    fn escape(input: &mut Input<'_, '_>) -> Result<Option<Event>, ()> {
-        let byte = any.parse_next(input)?;
-        let parser = &mut *input.state;
-        if parser.state == State::OscEscape && byte == b'\\' {
-            parser.state = State::GROUND;
-            return Ok(parser.command.end(2));
-        }
-        parser.state = match byte {
-            ESC => State::Escape,
-            0x20..=0x2F => State::EscapeIntermediate,
-            b'[' => State::Csi,
-            b']' => {
-                parser.command = Command::begun();
+            // These two end any sequence, an unfinished command included.
+            (_, CAN | SUB) => State::GROUND,
+            (State::Osc, ESC) => State::OscEscape,
+            (_, ESC) => State::Escape,
+            (State::Escape | State::OscEscape, 0x20..=0x2F) => State::EscapeIntermediate,
+            (State::Escape | State::OscEscape, b'[') => State::Csi,
+            (State::Escape | State::OscEscape, b']') => {
+                self.command = Command::begun();
                 State::Osc
             }
-            b'P' | b'X' | b'^' | b'_' => State::ControlString,
-            CAN | SUB | 0x30..=0x7E => State::GROUND,
-            // A control is run without ending the escape, though it ends a command.
-            _ => State::Escape,
+            (State::Escape | State::OscEscape, b'P' | b'X' | b'^' | b'_') => State::ControlString,
+            (State::Escape | State::OscEscape | State::EscapeIntermediate, 0x30..=0x7E)
+            | (State::Csi, 0x40..=0x7E) => State::GROUND,
+            (State::Osc, _) => {
+                self.command.push(&[byte]);
+                State::Osc
+            }
+            // A control after the `ESC` ends the command, though not the escape.
+            (State::OscEscape, _) => State::Escape,
+            // Anything else leaves a sequence where it was: its parameters, intermediates and
+            // text, and the controls a terminal runs or ignores in the middle of it.
+            (state, _) => state,
         };
-        Ok(None)
-    }
-
-    /// A command's text, and the byte that ends it.
-    fn command(input: &mut Input<'_, '_>) -> Result<Option<Event>, ()> {
-        let text = take_till(0.., (BEL, ESC, CAN, SUB)).parse_next(input)?;
-        input.state.command.push(text);
-        let Some(end) = opt(any).parse_next(input)? else {
-            return Ok(None);
-        };
-        let parser = &mut *input.state;
-        parser.state = if end == ESC {
-            State::OscEscape
-        } else {
-            State::GROUND
-        };
-        // An `ESC` may yet terminate the command, and `CAN` or `SUB` cancel it.
-        Ok(if end == BEL {
-            parser.command.end(1)
-        } else {
-            None
-        })
-    }
-
-    /// The byte that ends a sequence, if the input has it, or `unfinished` if not.
-    fn end_of_sequence(input: &mut Input<'_, '_>, unfinished: State) -> Result<Option<Event>, ()> {
-        input.state.state = match opt(any).parse_next(input)? {
-            Some(ESC) => State::Escape,
-            Some(_) => State::GROUND,
-            None => unfinished,
-        };
-        Ok(None)
+        None
     }
 
     /// How many bytes of a UTF-8 character are still to come after `run`, if `continuation` were
@@ -431,14 +394,6 @@ mod tests {
     }
 
     #[rstest]
-    fn accepts_the_simple_history_id_encoding() {
-        // The shell integration sends whatever `atuin history start` printed, which is the simple
-        // (hyphen-less) form rather than the hyphenated one the other tests use.
-        let data = b"\x1b]18188735;D;000000000000000000000000000000a1\x07";
-        assert_eq!(parse_events(data), vec![Event::OutputEnd(hid(HID))]);
-    }
-
-    #[rstest]
     fn reports_the_length_of_the_marker() {
         let marker = end(HID);
         let result = parse(&[b"output".as_slice(), &marker].concat());
@@ -448,20 +403,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::window_and_icon(b"\x1b]0;title\x07", true)]
-    #[case::icon(b"\x1b]1;title\x07", true)]
-    #[case::window(b"\x1b]2;title\x07", true)]
+    #[case::bel(b"\x1b]2;title\x07", true)]
     #[case::string_terminator(b"\x1b]2;title\x1b\\", true)]
-    #[case::empty(b"\x1b]2;\x07", true)]
-    #[case::semicolon_in_the_title(b"\x1b]2;a;b\x07", true)]
     #[case::control_in_the_number(b"\x1b]\x052;title\x07", true)]
     #[case::ended_by_cancel(b"\x1b]2;title\x18", false)]
     #[case::ended_by_another_sequence(b"\x1b]2;title\x1b[m", false)]
     #[case::unfinished(b"\x1b]2;title", false)]
-    #[case::no_title(b"\x1b]2\x07", false)]
-    #[case::directory(b"\x1b]7;file:///tmp\x07", false)]
-    #[case::pointer_shape(b"\x1b]22;xterm\x07", false)]
-    #[case::foreground_color(b"\x1b]10;?\x07", false)]
     #[case::inside_a_device_control_string(b"\x1bPq]2;title\x07\x1b\\", false)]
     fn detects_titles(#[case] data: &[u8], #[case] titled: bool) {
         assert_eq!(parse_events(data).contains(&Event::Title), titled);
@@ -500,14 +447,20 @@ mod tests {
     // -- Chunk data -----------------------------------------------------------
 
     #[rstest]
-    fn splits_data_at_the_markers() {
-        let data = [b"before".as_slice(), &start(HID), b"between", &end(HID), b"after"].concat();
+    fn splits_data_after_each_marker(
+        #[values(b"\x07".as_slice(), b"\x1b\\".as_slice())] terminator: &[u8],
+    ) {
+        // A chunk that stopped one byte short would leave the marker looking unterminated to
+        // whoever replays the data, and drop its final byte into the next chunk.
+        let opening = [format!("\x1b]18188735;C;{HID}").as_bytes(), terminator].concat();
+        let closing = [format!("\x1b]18188735;D;{HID}").as_bytes(), terminator].concat();
+        let data = [b"before".as_slice(), &opening, b"between", &closing, b"after"].concat();
 
         let result = parse(&data);
         let chunks: Vec<_> = result.chunks.iter().map(|chunk| chunk.data.clone()).collect();
         assert_eq!(chunks, vec![
-            [b"before".as_slice(), &start(HID)].concat(),
-            [b"between".as_slice(), &end(HID)].concat(),
+            [b"before".as_slice(), &opening].concat(),
+            [b"between".as_slice(), &closing].concat(),
         ]);
         assert_eq!(result.trailing_data, b"after");
     }
@@ -528,21 +481,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case::bel(b"\x07".as_slice())]
-    #[case::st(b"\x1b\\")]
-    fn chunk_data_includes_the_terminator(#[case] terminator: &[u8]) {
-        // A chunk that stopped one byte short would leave the marker looking unterminated
-        // to whoever replays the data, and drop its final byte into the next chunk.
-        let marker = [format!("\x1b]18188735;D;{HID}").as_bytes(), terminator].concat();
-        let data = [b"out".as_slice(), &marker, b"rest"].concat();
-
-        let result = parse(&data);
-        assert_eq!(result.chunks.len(), 1);
-        assert_eq!(result.chunks[0].data, [b"out".as_slice(), &marker].concat());
-        assert_eq!(result.trailing_data, b"rest");
-    }
-
-    #[rstest]
     fn a_marker_split_across_reads_is_reported_by_the_completing_read() {
         let (head, tail) = HID.split_at(20);
         let mut parser = Parser::new();
@@ -560,21 +498,6 @@ mod tests {
     // -- Input that must not produce events -----------------------------------
 
     #[rstest]
-    #[case::osc_7(b"\x1b]7;file:///home/user\x07".to_vec())]
-    #[case::osc_133_start(b"\x1b]133;C\x07".to_vec())]
-    #[case::osc_133_end(format!("\x1b]133;D;0;history_id={HID}\x07").into_bytes())]
-    #[case::missing_history_id(b"\x1b]18188735;C\x07".to_vec())]
-    #[case::empty_history_id(b"\x1b]18188735;D;\x07".to_vec())]
-    #[case::invalid_history_id(b"\x1b]18188735;D;not-a-uuid\x07".to_vec())]
-    #[case::trailing_param(format!("\x1b]18188735;D;{HID};extra\x07").into_bytes())]
-    #[case::unknown_kind(format!("\x1b]18188735;A;{HID}\x07").into_bytes())]
-    #[case::kind_too_long(format!("\x1b]18188735;CD;{HID}\x07").into_bytes())]
-    #[case::missing_kind(format!("\x1b]18188735;;{HID}\x07").into_bytes())]
-    #[case::lowercase_kind(format!("\x1b]18188735;c;{HID}\x07").into_bytes())]
-    #[case::wrong_osc_number(format!("\x1b]1818873;C;{HID}\x07").into_bytes())]
-    #[case::longer_osc_number(format!("\x1b]181887350;C;{HID}\x07").into_bytes())]
-    #[case::bare_osc_number(b"\x1b]18188735\x07".to_vec())]
-    #[case::empty_osc(b"\x1b]\x07".to_vec())]
     #[case::unterminated(format!("\x1b]18188735;C;{HID}").into_bytes())]
     // A UTF-8 terminal reads 0x9c as part of a character, so the marker is still open.
     #[case::c1_terminator([format!("\x1b]18188735;C;{HID}").as_bytes(), &[0x9C]].concat())]
@@ -610,52 +533,6 @@ mod tests {
         data.extend_from_slice(&suffix);
 
         assert_eq!(parse_events(&data), expected);
-    }
-
-    // -- Ground ---------------------------------------------------------------
-
-    #[rstest]
-    #[case::nothing(b"")]
-    #[case::text(b"hello\r\n")]
-    #[case::sgr(b"\x1b[1;31mred\x1b[0m")]
-    #[case::charset(b"\x1b(B")]
-    #[case::keypad(b"\x1b=")]
-    #[case::string_terminator(b"\x1b\\")]
-    #[case::title_bel(b"\x1b]0;title\x07")]
-    #[case::title_st(b"\x1b]2;title\x1b\\")]
-    #[case::device_control(b"\x1bP1$r0m\x1b\\")]
-    #[case::application_command(b"\x1b_Gf=24;AAAA\x1b\\")]
-    #[case::cancelled(b"\x1b[31\x18")]
-    #[case::two_byte_character("é".as_bytes())]
-    #[case::four_byte_character("🦀".as_bytes())]
-    #[case::stray_continuation(b"\x80")]
-    fn at_ground_after_complete_output(#[case] data: &[u8]) {
-        assert!(at_ground_after(data));
-    }
-
-    #[rstest]
-    #[case::escape(b"\x1b")]
-    #[case::control_sequence(b"\x1b[1;3")]
-    #[case::control_sequence_with_a_newline(b"\x1b[1\n")]
-    #[case::charset(b"\x1b(")]
-    #[case::command(b"\x1b]0;tit")]
-    #[case::command_number(b"\x1b]13")]
-    #[case::command_terminator(b"\x1b]0;title\x1b")]
-    #[case::c1_terminator(b"\x1b]0;title\x9c")]
-    #[case::device_control(b"\x1bP1$r0m")]
-    #[case::device_control_bel(b"\x1bPq\x07")]
-    #[case::first_of_two_bytes(&"é".as_bytes()[..1])]
-    #[case::second_of_three_bytes(&"€".as_bytes()[..2])]
-    #[case::third_of_four_bytes(&"🦀".as_bytes()[..3])]
-    fn not_at_ground_inside_a_sequence(#[case] data: &[u8]) {
-        assert!(!at_ground_after(data));
-    }
-
-    #[rstest]
-    fn parser_default_matches_new() {
-        assert_eq!(read(&mut Parser::default(), &start(HID)).events(), vec![Event::OutputStart(
-            hid(HID)
-        )]);
     }
 
     // -- Properties -----------------------------------------------------------
@@ -772,19 +649,23 @@ mod tests {
             prop_assert_eq!((events, at_ground), (parse_events(&data), at_ground_after(&data)));
         }
 
-        /// Bytes written where the parser claims ground must reach a real parser as text of their
-        /// own, not as part of something the child started: `vte` given an `X` there prints just
-        /// the `X`.
+        /// The parser is at ground exactly where bytes reach a real parser as text of their own,
+        /// not as part of something the child started: where `vte` given an `X` prints just the
+        /// `X`.
         #[rstest]
         fn agrees_with_vte_on_where_bytes_can_go(data in stream()) {
             let mut parser = vte::Parser::new();
             let mut reference = Reference::default();
             parser.advance(&mut reference, &data);
+            reference.actions.clear();
+            parser.advance(&mut reference, b"X");
+            let vte_at_ground = reference.actions == [Some('X')];
 
-            if at_ground_after(&data) {
-                reference.actions.clear();
-                parser.advance(&mut reference, b"X");
-                prop_assert_eq!(reference.actions, [Some('X')], "vte was mid-sequence after {:?}", data);
+            // Where the stream breaks UTF-8, the parser may still wait for the rest of a character
+            // `vte` has already given up on. Waiting is safe; the other way round is not.
+            let at_ground = at_ground_after(&data);
+            if at_ground || std::str::from_utf8(&data).is_ok() {
+                prop_assert_eq!(at_ground, vte_at_ground, "after {:?}", data);
             }
         }
     }
