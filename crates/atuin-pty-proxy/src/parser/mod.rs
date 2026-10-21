@@ -28,9 +28,6 @@ const CAN: u8 = 0x18;
 const SUB: u8 = 0x1A;
 
 /// An event with the slice of data up to the end of its command.
-///
-/// Concatenating [`Self::data`] for every chunk, followed by [`EventChunks::trailing_data`],
-/// exactly reproduces the bytes passed to [`Parser::push`].
 #[derive(Debug, Clone, Copy)]
 pub struct EventChunk<'a> {
     /// What the command said.
@@ -45,56 +42,51 @@ pub struct EventChunk<'a> {
     pub osc_len: usize,
 }
 
-/// An iterator of events, created by [`Parser::push`].
+/// A read of the child's output, with what the parser found in it.
 ///
-/// After exhausting the iterator, you will likely want to call [`Self::trailing_data`] to get the
-/// last chunk of data that was not yielded by the iterator. You may need to use
-/// [`Iterator::by_ref`] when iterating to ensure you still have access to the iterator afterward.
-///
-/// Dropping the iterator follows whatever data it has not yet, so the parser always ends up past
-/// everything pushed.
-pub struct EventChunks<'parser, 'data> {
-    parser: &'parser mut Parser,
-    /// The data not yet yielded in a chunk.
-    data: &'data [u8],
-    /// How much of `data` the parser has followed.
-    scanned: usize,
+/// Concatenating [`EventChunk::data`] for every chunk, followed by [`Self::trailing_data`],
+/// exactly reproduces [`Self::data`].
+#[derive(Debug)]
+pub struct Output {
+    data: Vec<u8>,
+    /// Each event, with where its command ends in `data`.
+    events: Vec<Found>,
+    at_ground: bool,
 }
 
-impl<'data> Iterator for EventChunks<'_, 'data> {
-    type Item = EventChunk<'data>;
+impl Output {
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        let (scanned, event) = self.parser.scan(&self.data[self.scanned..]);
-        self.scanned += scanned;
-        let event = event?;
-
-        let (data, rest) = self.data.split_at(self.scanned);
-        self.data = rest;
-        self.scanned = 0;
-        Some(EventChunk {
-            event,
-            data,
-            osc_len: self.parser.command.len,
+    /// The output, cut after each command the proxy follows.
+    pub fn chunks(&self) -> impl Iterator<Item = EventChunk<'_>> {
+        let starts = std::iter::once(0).chain(self.events.iter().map(|found| found.end));
+        self.events.iter().zip(starts).map(|(found, start)| EventChunk {
+            event: found.event,
+            data: &self.data[start..found.end],
+            osc_len: found.osc_len,
         })
     }
-}
 
-impl std::iter::FusedIterator for EventChunks<'_, '_> {}
+    /// The output after the last command the proxy follows.
+    pub fn trailing_data(&self) -> &[u8] {
+        &self.data[self.events.last().map_or(0, |found| found.end)..]
+    }
 
-impl Drop for EventChunks<'_, '_> {
-    fn drop(&mut self) {
-        for _ in self.by_ref() {}
+    /// Whether the output ends between sequences and characters, where bytes of the proxy's own
+    /// can't change the meaning of the child's.
+    pub const fn at_ground(&self) -> bool {
+        self.at_ground
     }
 }
 
-impl<'data> EventChunks<'_, 'data> {
-    /// Get the last bit of data not yielded by this iterator.
-    ///
-    /// This method is intended to be called once the iterator has been exhausted.
-    pub fn trailing_data(&self) -> &'data [u8] {
-        self.data
-    }
+/// An event, and where its command ends in the output it was found in.
+#[derive(Debug, Clone, Copy)]
+struct Found {
+    event: Event,
+    end: usize,
+    osc_len: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,11 +155,10 @@ impl Command {
     }
 }
 
-/// A streaming, zero-allocation parser for the child's output.
+/// A streaming parser for the child's output.
 ///
-/// Feed arbitrary byte slices into [`Parser::push`]. The parser detects the commands it follows and
-/// returns an iterator of [`EventChunk`]s, each containing an [`Event`] and the data up to that
-/// point.
+/// Feed each read of the output into [`Parser::read`], however the reads cut it. The parser returns
+/// the read as an [`Output`], with the [`Event`]s of the commands it follows.
 #[derive(Debug)]
 pub struct Parser {
     state: State,
@@ -195,20 +186,27 @@ impl Parser {
         }
     }
 
-    /// Process a chunk of bytes, yielding an [`EventChunk`] for every command the proxy follows,
-    /// containing the event and all the data up to that point.
-    pub fn push<'data>(&mut self, data: &'data [u8]) -> EventChunks<'_, 'data> {
-        EventChunks {
-            parser: self,
-            data,
-            scanned: 0,
+    /// Follow `data`, the next read of the child's output.
+    pub fn read(&mut self, data: Vec<u8>) -> Output {
+        let mut events = Vec::new();
+        let mut end = 0;
+        loop {
+            let (scanned, event) = self.scan(&data[end..]);
+            end += scanned;
+            let Some(event) = event else {
+                break;
+            };
+            events.push(Found {
+                event,
+                end,
+                osc_len: self.command.len,
+            });
         }
-    }
-
-    /// Whether the output is between escape sequences and characters, where bytes of our own can't
-    /// change the meaning of the child's.
-    pub const fn at_ground(&self) -> bool {
-        matches!(self.state, State::GROUND)
+        Output {
+            data,
+            events,
+            at_ground: self.state == State::GROUND,
+        }
     }
 
     /// Follow `data` up to the end of the first command the proxy follows, returning how much of
@@ -373,50 +371,49 @@ mod tests {
         osc_len: usize,
     }
 
-    /// The full result of one [`Parser::push`] call.
+    /// The full result of one [`Parser::read`] call.
     #[derive(Debug, Clone, PartialEq, Eq)]
-    struct Push {
+    struct Read {
         chunks: Vec<OwnedChunk>,
         trailing_data: Vec<u8>,
+        at_ground: bool,
     }
 
-    impl Push {
+    impl Read {
         fn events(&self) -> Vec<Event> {
             self.chunks.iter().map(|chunk| chunk.event).collect()
         }
     }
 
-    fn push(parser: &mut Parser, data: &[u8]) -> Push {
-        let mut iter = parser.push(data);
-        let chunks = iter
-            .by_ref()
-            .map(|chunk| OwnedChunk {
-                event: chunk.event,
-                data: chunk.data.to_vec(),
-                osc_len: chunk.osc_len,
-            })
-            .collect();
-        Push {
-            chunks,
-            trailing_data: iter.trailing_data().to_vec(),
+    fn read(parser: &mut Parser, data: &[u8]) -> Read {
+        let output = parser.read(data.to_vec());
+        Read {
+            chunks: output
+                .chunks()
+                .map(|chunk| OwnedChunk {
+                    event: chunk.event,
+                    data: chunk.data.to_vec(),
+                    osc_len: chunk.osc_len,
+                })
+                .collect(),
+            trailing_data: output.trailing_data().to_vec(),
+            at_ground: output.at_ground(),
         }
     }
 
-    /// Push `data` through a fresh parser in a single call.
-    fn parse(data: &[u8]) -> Push {
-        push(&mut Parser::new(), data)
+    /// Read `data` with a fresh parser.
+    fn parse(data: &[u8]) -> Read {
+        read(&mut Parser::new(), data)
     }
 
-    /// Collect all events from a single `push` call.
+    /// Collect all events from a single read.
     fn parse_events(data: &[u8]) -> Vec<Event> {
         parse(data).events()
     }
 
     /// Whether a fresh parser given `data` ends up between sequences and characters.
     fn at_ground_after(data: &[u8]) -> bool {
-        let mut parser = Parser::new();
-        drop(parser.push(data));
-        parser.at_ground()
+        parse(data).at_ground
     }
 
     // -- Basic event detection ------------------------------------------------
@@ -470,7 +467,7 @@ mod tests {
         assert_eq!(parse_events(data).contains(&Event::Title), titled);
     }
 
-    // -- Multiple events / interleaved text in one push -----------------------
+    // -- Multiple events / interleaved text in one read -----------------------
 
     #[rstest]
     fn emits_events_in_order_around_other_output() {
@@ -546,15 +543,15 @@ mod tests {
     }
 
     #[rstest]
-    fn a_marker_split_across_pushes_is_reported_by_the_completing_push() {
+    fn a_marker_split_across_reads_is_reported_by_the_completing_read() {
         let (head, tail) = HID.split_at(20);
         let mut parser = Parser::new();
 
-        let first = push(&mut parser, format!("out\x1b]18188735;D;{head}").as_bytes());
+        let first = read(&mut parser, format!("out\x1b]18188735;D;{head}").as_bytes());
         assert!(first.chunks.is_empty());
         assert_eq!(first.trailing_data, format!("out\x1b]18188735;D;{head}").as_bytes());
 
-        let second = push(&mut parser, format!("{tail}\x07rest").as_bytes());
+        let second = read(&mut parser, format!("{tail}\x07rest").as_bytes());
         assert_eq!(second.events(), vec![Event::OutputEnd(hid(HID))]);
         assert_eq!(second.chunks[0].data, format!("{tail}\x07").as_bytes());
         assert_eq!(second.trailing_data, b"rest");
@@ -654,36 +651,11 @@ mod tests {
         assert!(!at_ground_after(data));
     }
 
-    // -- Fused ----------------------------------------------------------------
-
-    #[rstest]
-    fn iterator_is_fused() {
-        let data = [start(HID).as_slice(), b"tail"].concat();
-        let mut parser = Parser::new();
-        let mut iter = parser.push(&data);
-
-        assert!(iter.next().is_some());
-        assert!(iter.next().is_none());
-        assert!(iter.next().is_none());
-        assert_eq!(iter.trailing_data(), b"tail");
-    }
-
     #[rstest]
     fn parser_default_matches_new() {
-        assert_eq!(push(&mut Parser::default(), &start(HID)).events(), vec![Event::OutputStart(
+        assert_eq!(read(&mut Parser::default(), &start(HID)).events(), vec![Event::OutputStart(
             hid(HID)
         )]);
-    }
-
-    #[rstest]
-    fn dropping_the_chunks_follows_the_rest_of_the_data() {
-        // A caller that stops at the first event must not leave the parser behind the stream.
-        let mut parser = Parser::new();
-        let mut chunks = parser.push(b"\x1b]2;title\x07\x1b[31");
-        assert_eq!(chunks.next().map(|chunk| chunk.event), Some(Event::Title));
-        drop(chunks);
-
-        assert!(!parser.at_ground());
     }
 
     // -- Properties -----------------------------------------------------------
@@ -717,9 +689,9 @@ mod tests {
         prop::collection::vec(piece, 0..16).prop_map(|pieces| pieces.concat())
     }
 
-    /// What pushing `data` split at the given points made of it: every event, every byte handed
+    /// What reading `data` split at the given points made of it: every event, every byte handed
     /// back, and whether it ended at ground.
-    fn push_split(data: &[u8], splits: &[prop::sample::Index]) -> (Vec<Event>, Vec<u8>, bool) {
+    fn read_split(data: &[u8], splits: &[prop::sample::Index]) -> (Vec<Event>, Vec<u8>, bool) {
         let mut cuts: Vec<usize> = splits.iter().map(|index| index.index(data.len() + 1)).collect();
         cuts.push(0);
         cuts.push(data.len());
@@ -728,15 +700,17 @@ mod tests {
         let mut parser = Parser::new();
         let mut events = Vec::new();
         let mut rebuilt = Vec::new();
+        let mut at_ground = true;
         for window in cuts.windows(2) {
-            let result = push(&mut parser, &data[window[0]..window[1]]);
+            let result = read(&mut parser, &data[window[0]..window[1]]);
             events.extend(result.events());
             for chunk in result.chunks {
                 rebuilt.extend(chunk.data);
             }
             rebuilt.extend(result.trailing_data);
+            at_ground = result.at_ground;
         }
-        (events, rebuilt, parser.at_ground())
+        (events, rebuilt, at_ground)
     }
 
     /// Records what `vte` does: each character it prints, and `None` for anything else.
@@ -783,7 +757,7 @@ mod tests {
             data in stream(),
             splits in prop::collection::vec(any::<prop::sample::Index>(), 0..6),
         ) {
-            let (_, rebuilt, _) = push_split(&data, &splits);
+            let (_, rebuilt, _) = read_split(&data, &splits);
             prop_assert_eq!(rebuilt, data);
         }
 
@@ -794,7 +768,7 @@ mod tests {
             data in stream(),
             splits in prop::collection::vec(any::<prop::sample::Index>(), 0..6),
         ) {
-            let (events, _, at_ground) = push_split(&data, &splits);
+            let (events, _, at_ground) = read_split(&data, &splits);
             prop_assert_eq!((events, at_ground), (parse_events(&data), at_ground_after(&data)));
         }
 

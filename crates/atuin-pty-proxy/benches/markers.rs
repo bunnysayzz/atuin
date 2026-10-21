@@ -8,7 +8,7 @@ fn main() {
 // submodule is dropped. It lives at the crate root (not inside `mod unix`) so `#[path]` resolves
 // against `benches/`, a directory that actually exists.
 #[cfg(unix)]
-#[allow(dead_code)] // only Parser/push are exercised here; the rest of the API is unused.
+#[allow(dead_code)] // only Parser::read is exercised here; the rest of the API is unused.
 #[path = "../src/parser/mod.rs"]
 mod parser;
 
@@ -44,11 +44,9 @@ mod unix {
             .with_inputs(|| stream(cycles))
             .input_counter(|data| divan::counter::BytesCount::of_slice(data.as_slice()))
             .bench_values(|data| {
-                let mut parser = parser::Parser::new();
-                let mut chunks = parser.push(&data);
-                let count = chunks.by_ref().count();
-                divan::black_box(chunks.trailing_data());
-                count
+                let output = parser::Parser::new().read(data);
+                divan::black_box(output.trailing_data());
+                output.chunks().count()
             });
     }
 }

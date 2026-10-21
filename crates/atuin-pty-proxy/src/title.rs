@@ -25,7 +25,7 @@ use atuin_common::os::unix::process;
 use rustix::process::Pid;
 
 use crate::foreground::Foreground;
-use crate::parser::{Event, Parser};
+use crate::parser::{Event, Output};
 
 /// The leader of the process group in the foreground, as a look at the foreground found it.
 pub struct Leader {
@@ -88,8 +88,8 @@ impl Owner {
 /// What the proxy knows of the terminal's title, from following everything written to it.
 pub struct TerminalTitle {
     foreground: Foreground,
-    /// Follows everything written to the terminal so far.
-    output: Parser,
+    /// Whether everything written to the terminal so far ends between sequences and characters.
+    at_ground: bool,
     owner: Owner,
     /// The title the proxy set, while the terminal still shows it.
     shown: Option<String>,
@@ -99,15 +99,16 @@ impl TerminalTitle {
     pub fn new(foreground: Foreground) -> Self {
         Self {
             foreground,
-            output: Parser::new(),
+            at_ground: true,
             owner: Owner::Proxy,
             shown: None,
         }
     }
 
-    /// Follow the child's `data` on its way to the terminal.
-    pub fn track(&mut self, data: &[u8]) {
-        if self.output.push(data).any(|chunk| chunk.event == Event::Title) {
+    /// Follow the child's `output` on its way to the terminal.
+    pub fn track(&mut self, output: &Output) {
+        self.at_ground = output.at_ground();
+        if output.chunks().any(|chunk| chunk.event == Event::Title) {
             // The program that set the title has most likely not left the foreground yet.
             self.owner = Owner::of_title_set_with(self.foreground.group(), self.foreground.child());
             self.shown = None;
@@ -121,7 +122,7 @@ impl TerminalTitle {
     pub fn retitle(&mut self, leader: Leader) -> Option<Vec<u8>> {
         // A program may have taken the foreground, and set a title that must stand, since the look
         // that found `leader`. The next look names it.
-        if self.foreground.group() != Some(leader.group) || !self.output.at_ground() {
+        if self.foreground.group() != Some(leader.group) || !self.at_ground {
             return None;
         }
         self.owner = self.owner.with_foreground(leader.group);
@@ -146,6 +147,7 @@ mod tests {
 
     use super::*;
     use crate::foreground;
+    use crate::parser::Parser;
 
     const SHELL: i32 = 100;
     const VIM: i32 = 200;
@@ -201,6 +203,8 @@ mod tests {
     /// `/bin/sh` on a pty of its own, and the title of a terminal its output goes to.
     struct Shell {
         title: TerminalTitle,
+        /// Follows what the shell's terminal is sent.
+        output: Parser,
         pid: Pid,
         /// The terminal, for typing at the shell.
         input: File,
@@ -208,6 +212,12 @@ mod tests {
     }
 
     impl Shell {
+        /// Send `data` to the shell's terminal, as if the shell had printed it.
+        fn print(&mut self, data: &[u8]) {
+            let output = self.output.read(data.to_vec());
+            self.title.track(&output);
+        }
+
         /// Wait for the foreground to be `shell`'s, or not, then return it.
         fn foreground_settles(&self, shells: bool) -> Pid {
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -296,6 +306,7 @@ mod tests {
         let pid = Pid::from_raw(child.process_id().expect("shell pid").cast_signed()).unwrap();
         let shell = Shell {
             title: TerminalTitle::new(Foreground::new(pair.master.as_ref(), Some(pid))),
+            output: Parser::new(),
             pid,
             input: File::from(foreground::pty_parent_fd(pair.master.as_ref()).unwrap()),
             child,
@@ -332,7 +343,7 @@ mod tests {
     fn a_programs_title_stands_until_it_leaves_the_foreground(mut shell: Shell) {
         shell.sleep();
         // What vim's `set title` sends.
-        shell.title.track(b"\x1b]2;file.txt - VIM\x07");
+        shell.print(b"\x1b]2;file.txt - VIM\x07");
         assert_eq!(shell.retitle(), None);
 
         shell.interrupt();
@@ -341,7 +352,7 @@ mod tests {
 
     #[rstest]
     fn a_title_the_shell_sets_stands_while_its_commands_run(mut shell: Shell) {
-        shell.title.track(b"\x1b]0;~/project\x07");
+        shell.print(b"\x1b]0;~/project\x07");
         assert_eq!(shell.retitle(), None);
 
         shell.sleep();
@@ -353,10 +364,10 @@ mod tests {
 
     #[rstest]
     fn titles_wait_for_an_escape_sequence_to_finish(mut shell: Shell) {
-        shell.title.track(b"\x1b[3");
+        shell.print(b"\x1b[3");
         assert_eq!(shell.retitle(), None);
 
-        shell.title.track(b"1m");
+        shell.print(b"1m");
         assert_eq!(shell.retitle(), Some(shell.shell_title()));
     }
 }

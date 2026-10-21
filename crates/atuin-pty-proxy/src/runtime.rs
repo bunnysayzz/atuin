@@ -12,8 +12,9 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
-use crate::debug::{MarkerDebugHighlighter, RESET};
+use crate::debug::RESET;
 use crate::foreground::{Foreground, ForegroundUpdater, pty_parent_fd};
+use crate::parser::Parser;
 use crate::pty_proxy::RuntimeOptions;
 use crate::screen::{self, Msg, SocketServer};
 use crate::title::TerminalTitle;
@@ -212,7 +213,9 @@ async fn run(options: RuntimeOptions) -> Result<i32, Error> {
 
     let debug_markers = options.debug_markers;
     let output = tokio::spawn(async move {
-        let mut highlighter = debug_markers.then(MarkerDebugHighlighter::new);
+        // The one parser of the child's output. Everything that follows the output takes what it
+        // found from here.
+        let mut parser = Parser::new();
         let mut buf = [0u8; 8192];
 
         loop {
@@ -220,24 +223,19 @@ async fn run(options: RuntimeOptions) -> Result<i32, Error> {
                 read = pty_reader.read(&mut buf) => match read {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let raw_data = &buf[..n];
-                        let highlighted;
-                        let data: &[u8] = if let Some(highlighter) = &mut highlighter {
-                            highlighted = highlighter.render(raw_data);
-                            &highlighted
-                        } else {
-                            raw_data
-                        };
-
-                        title.track(data);
-                        if stdout.write_all(data).await.is_err() {
+                        let output = parser.read(buf[..n].to_vec());
+                        let labelled = debug_markers.then(|| output.with_marker_labels());
+                        if stdout.write_all(labelled.as_deref().unwrap_or(output.data())).await.is_err() {
                             break;
                         }
+                        // The labels sit between sequences, so the terminal ends up where the
+                        // output does.
+                        title.track(&output);
 
                         // Only after the terminal has the chunk: handing it to the emulator wakes
                         // the emulator's thread, a syscall that would otherwise delay every echoed
                         // keystroke.
-                        let _ = msg_tx.send(Msg::Data(raw_data.to_vec())).await;
+                        let _ = msg_tx.send(Msg::Data(output)).await;
                         foreground_updater.update();
                     }
                 },
@@ -251,7 +249,7 @@ async fn run(options: RuntimeOptions) -> Result<i32, Error> {
             }
         }
 
-        if highlighter.is_some() {
+        if debug_markers {
             let _ = stdout.write_all(RESET).await;
         }
     });
