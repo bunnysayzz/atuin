@@ -17,6 +17,10 @@
 mod osc;
 
 pub use osc::Event;
+use winnow::Parser as _;
+use winnow::combinator::{alt, opt};
+use winnow::stream::Stateful;
+use winnow::token::{any, rest, take_till, take_until};
 
 const ESC: u8 = 0x1B;
 const BEL: u8 = 0x07;
@@ -115,7 +119,13 @@ enum State {
     ControlString,
 }
 
+impl State {
+    /// Between sequences and characters.
+    const GROUND: Self = Self::Ground { continuation: 0 };
+}
+
 /// The operating system command the output is in, or was last in.
+#[derive(Debug)]
 struct Command {
     /// The start of the command's text, without the controls `vte` leaves out of it.
     kept: [u8; Event::MAX_TEXT_LEN],
@@ -158,10 +168,17 @@ impl Command {
 /// Feed arbitrary byte slices into [`Parser::push`]. The parser detects the commands it follows and
 /// returns an iterator of [`EventChunk`]s, each containing an [`Event`] and the data up to that
 /// point.
+#[derive(Debug)]
 pub struct Parser {
     state: State,
     command: Command,
 }
+
+/// A chunk of output, with the parser that carries its state from one chunk to the next.
+///
+/// Backtracking resets only the chunk, so a step changes the parser only once it has parsed what
+/// it needs.
+type Input<'data, 'parser> = Stateful<&'data [u8], &'parser mut Parser>;
 
 impl Default for Parser {
     fn default() -> Self {
@@ -173,7 +190,7 @@ impl Parser {
     /// Create a new parser in the initial (ground) state.
     pub const fn new() -> Self {
         Self {
-            state: State::Ground { continuation: 0 },
+            state: State::GROUND,
             command: Command::begun(),
         }
     }
@@ -191,93 +208,117 @@ impl Parser {
     /// Whether the output is between escape sequences and characters, where bytes of our own can't
     /// change the meaning of the child's.
     pub const fn at_ground(&self) -> bool {
-        matches!(self.state, State::Ground { continuation: 0 })
+        matches!(self.state, State::GROUND)
     }
 
     /// Follow `data` up to the end of the first command the proxy follows, returning how much of
     /// `data` that took and what the command said, or all of `data` and nothing.
     fn scan(&mut self, data: &[u8]) -> (usize, Option<Event>) {
-        let mut rest = data;
-        loop {
-            match self.state {
-                // Plain text is most of any output, and only an `ESC` leads out of it. Searching
-                // for it with memchr is a ~10X improvement over stepping through the text.
-                State::Ground { continuation } => {
-                    let Some(escape) = memchr::memchr(ESC, rest) else {
-                        self.state = State::Ground {
-                            continuation: Self::continuation_after(continuation, rest),
-                        };
-                        return (data.len(), None);
-                    };
-                    self.state = State::Escape;
-                    rest = &rest[escape + 1..];
-                }
-                // Only these lead out of a command's text.
-                State::Osc => {
-                    let end = rest
-                        .iter()
-                        .position(|byte| matches!(*byte, BEL | ESC | CAN | SUB))
-                        .unwrap_or(rest.len());
-                    let (text, tail) = rest.split_at(end);
-                    self.command.push(text);
-                    rest = tail;
-                }
-                State::Escape
-                | State::EscapeIntermediate
-                | State::Csi
-                | State::OscEscape
-                | State::ControlString => {}
+        let mut input = Input {
+            input: data,
+            state: self,
+        };
+        while !input.input.is_empty() {
+            match Self::step(&mut input) {
+                Ok(None) => {}
+                Ok(Some(event)) => return (data.len() - input.input.len(), Some(event)),
+                // No step fails on input that isn't empty. Were one to, the rest of the chunk
+                // would still reach the terminal; only the parser would miss it.
+                Err(()) => break,
             }
-            let Some((&byte, tail)) = rest.split_first() else {
-                return (data.len(), None);
-            };
-            rest = tail;
-            if let Some(event) = self.advance(byte) {
-                return (data.len() - rest.len(), Some(event));
+        }
+        (data.len(), None)
+    }
+
+    /// Follow the input in its current state, up to the next change of state.
+    fn step(input: &mut Input<'_, '_>) -> Result<Option<Event>, ()> {
+        match input.state.state {
+            State::Ground { continuation } => Self::text(input, continuation),
+            State::Escape | State::OscEscape => Self::escape(input),
+            State::EscapeIntermediate => {
+                take_till(0.., |byte| matches!(byte, 0x30..=0x7E | ESC | CAN | SUB))
+                    .parse_next(input)?;
+                Self::end_of_sequence(input, State::EscapeIntermediate)
+            }
+            State::Csi => {
+                take_till(0.., |byte| matches!(byte, 0x40..=0x7E | ESC | CAN | SUB))
+                    .parse_next(input)?;
+                Self::end_of_sequence(input, State::Csi)
+            }
+            State::Osc => Self::command(input),
+            State::ControlString => {
+                alt((take_until(0.., (ESC, CAN, SUB)), rest)).parse_next(input)?;
+                Self::end_of_sequence(input, State::ControlString)
             }
         }
     }
 
-    /// Follow one byte, returning what the command it terminated said.
-    fn advance(&mut self, byte: u8) -> Option<Event> {
-        let ground = State::Ground { continuation: 0 };
-        self.state = match (self.state, byte) {
-            (State::Ground { .. }, ESC) => State::Escape,
-            (State::Ground { continuation }, _) => State::Ground {
-                continuation: Self::continuation_after(continuation, &[byte]),
-            },
-            (State::Osc, BEL) => {
-                self.state = ground;
-                return self.command.end(1);
-            }
-            (State::OscEscape, b'\\') => {
-                self.state = ground;
-                return self.command.end(2);
-            }
-            // These two end any sequence, an unfinished command included.
-            (_, CAN | SUB) => ground,
-            (State::Osc, ESC) => State::OscEscape,
-            (_, ESC) => State::Escape,
-            (State::Escape | State::OscEscape, 0x20..=0x2F) => State::EscapeIntermediate,
-            (State::Escape | State::OscEscape, b'[') => State::Csi,
-            (State::Escape | State::OscEscape, b']') => {
-                self.command = Command::begun();
-                State::Osc
-            }
-            (State::Escape | State::OscEscape, b'P' | b'X' | b'^' | b'_') => State::ControlString,
-            (State::Escape | State::OscEscape | State::EscapeIntermediate, 0x30..=0x7E)
-            | (State::Csi, 0x40..=0x7E) => ground,
-            (State::Osc, _) => {
-                self.command.push(&[byte]);
-                State::Osc
-            }
-            // A control after the `ESC` ends the command, though not the escape.
-            (State::OscEscape, _) => State::Escape,
-            // Anything else leaves a sequence where it was: its parameters, intermediates and
-            // text, and the controls a terminal runs or ignores in the middle of it.
-            (state, _) => state,
+    /// Plain text, up to the `ESC` that leads out of it.
+    fn text(input: &mut Input<'_, '_>, continuation: u8) -> Result<Option<Event>, ()> {
+        // Plain text is most of any output. Searching for its end with memchr is a ~10X improvement
+        // over stepping through it.
+        let text = alt((take_until(0.., ESC), rest)).parse_next(input)?;
+        let continuation = Self::continuation_after(continuation, text);
+        input.state.state = match opt(ESC).parse_next(input)? {
+            Some(_) => State::Escape,
+            None => State::Ground { continuation },
         };
-        None
+        Ok(None)
+    }
+
+    /// The byte after an `ESC`.
+    fn escape(input: &mut Input<'_, '_>) -> Result<Option<Event>, ()> {
+        let byte = any.parse_next(input)?;
+        let parser = &mut *input.state;
+        if parser.state == State::OscEscape && byte == b'\\' {
+            parser.state = State::GROUND;
+            return Ok(parser.command.end(2));
+        }
+        parser.state = match byte {
+            ESC => State::Escape,
+            0x20..=0x2F => State::EscapeIntermediate,
+            b'[' => State::Csi,
+            b']' => {
+                parser.command = Command::begun();
+                State::Osc
+            }
+            b'P' | b'X' | b'^' | b'_' => State::ControlString,
+            CAN | SUB | 0x30..=0x7E => State::GROUND,
+            // A control is run without ending the escape, though it ends a command.
+            _ => State::Escape,
+        };
+        Ok(None)
+    }
+
+    /// A command's text, and the byte that ends it.
+    fn command(input: &mut Input<'_, '_>) -> Result<Option<Event>, ()> {
+        let text = take_till(0.., (BEL, ESC, CAN, SUB)).parse_next(input)?;
+        input.state.command.push(text);
+        let Some(end) = opt(any).parse_next(input)? else {
+            return Ok(None);
+        };
+        let parser = &mut *input.state;
+        parser.state = if end == ESC {
+            State::OscEscape
+        } else {
+            State::GROUND
+        };
+        // An `ESC` may yet terminate the command, and `CAN` or `SUB` cancel it.
+        Ok(if end == BEL {
+            parser.command.end(1)
+        } else {
+            None
+        })
+    }
+
+    /// The byte that ends a sequence, if the input has it, or `unfinished` if not.
+    fn end_of_sequence(input: &mut Input<'_, '_>, unfinished: State) -> Result<Option<Event>, ()> {
+        input.state.state = match opt(any).parse_next(input)? {
+            Some(ESC) => State::Escape,
+            Some(_) => State::GROUND,
+            None => unfinished,
+        };
+        Ok(None)
     }
 
     /// How many bytes of a UTF-8 character are still to come after `run`, if `continuation` were
@@ -302,6 +343,7 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use atuin_client::history::HistoryId;
+    use proptest::arbitrary::any;
     use proptest::prelude::*;
     use rstest::rstest;
 
